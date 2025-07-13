@@ -1,0 +1,1 @@
+a house with some rooms, a robotic arm with wheels and rgbd camera in one room, a beer bottle inside a fridge shelf in one room, and a cup on a table in one room. the bot should travel to the fridge, open it and graps the beer bottle, then go the table and pour in the cup in another room. 
