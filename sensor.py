@@ -2,7 +2,6 @@ import pybullet as p
 import numpy as np
 import cv2
 from object_detection import ObjectDetector
-from room_mapping import RoomMapper
 from camera_utils import CameraManager
 from visualization import VisualizationManager
 
@@ -14,7 +13,7 @@ class SensorManager:
         # Initialize all subsystems
         self.camera_manager = CameraManager()
         self.object_detector = ObjectDetector()
-        self.room_mapper = RoomMapper()
+
         self.visualizer = VisualizationManager()
         
         # === Navigation Camera Parameters (Main Camera) ===
@@ -43,8 +42,7 @@ class SensorManager:
         
         # === Object Detection Parameters ===
         self.object_detection_enabled = True
-        self.bottle_color_range = [(5, 100, 100), (25, 255, 255)]  # HSV range for bottle detection
-        self.cup_color_range = [(20, 100, 100), (30, 255, 255)]    # HSV range for cup detection
+        
         
         # === Segmentation Parameters ===
         self.segmentation_enabled = True
@@ -62,18 +60,48 @@ class SensorManager:
         if camera_type == "navigation":
             robot_pos, robot_orn = p.getBasePositionAndOrientation(self.husky_id)
         else:  # manipulation
-            if self.panda_id is None:
-                return None, None, None
-            end_effector_state = p.getLinkState(self.panda_id, 11)  # Panda end effector link
-            robot_pos = end_effector_state[0]
-            robot_orn = end_effector_state[1]
+            # Use Husky position for manipulation camera (mounted on robot)
+            robot_pos, robot_orn = p.getBasePositionAndOrientation(self.husky_id)
             
         return self.camera_manager.get_camera_image(robot_pos, robot_orn, camera_type)
     
     def get_lidar_data(self):
         """Get LiDAR data using ray casting"""
         husky_pos, husky_orn = p.getBasePositionAndOrientation(self.husky_id)
-        return self.room_mapper.get_obstacle_map(husky_pos, husky_orn)
+        
+        # Convert quaternion to rotation matrix
+        rotation_matrix = p.getMatrixFromQuaternion(husky_orn)
+        rotation_matrix = np.array(rotation_matrix).reshape(3, 3)
+        
+        # Calculate LiDAR position in world coordinates
+        lidar_pos_local = np.array(self.lidar_offset)
+        lidar_pos_world = np.array(husky_pos) + rotation_matrix @ lidar_pos_local
+        
+        # Generate ray directions (360 degrees around Z-axis)
+        angles = np.linspace(0, 2*np.pi, self.lidar_resolution, endpoint=False)
+        ranges = []
+        hit_objects = []
+        
+        for angle in angles:
+            # Ray direction in local coordinates (XY plane)
+            ray_dir_local = np.array([np.cos(angle), np.sin(angle), 0])
+            # Transform to world coordinates
+            ray_dir_world = rotation_matrix @ ray_dir_local
+            # End point of ray
+            ray_end = lidar_pos_world + ray_dir_world * self.lidar_range
+            
+            # Cast ray
+            ray_result = p.rayTest(lidar_pos_world, ray_end)
+            
+            if ray_result[0][0] >= 0:  # Hit something
+                hit_distance = ray_result[0][2] * self.lidar_range
+                ranges.append(hit_distance)
+                hit_objects.append(ray_result[0][0])  # Object ID
+            else:  # No hit
+                ranges.append(self.lidar_range)
+                hit_objects.append(-1)
+        
+        return np.array(ranges), angles, hit_objects
     
     def detect_objects(self, rgb_image, depth_image):
         """Detect objects in the camera feed"""
@@ -88,36 +116,8 @@ class SensorManager:
         return self.visualizer.visualize_lidar(ranges, angles, self.lidar_range, self.lidar_resolution, hit_objects, width, height)
     
     def update_displays(self):
-        """Update all sensor displays"""
-        try:
-            # Get camera data
-            nav_rgb, nav_depth, nav_seg = self.get_camera_data("navigation")
-            manip_rgb, manip_depth, manip_seg = self.get_camera_data("manipulation")
-            
-            # Get LiDAR data
-            lidar_data = self.get_lidar_data()
-            
-            # Process object detection
-            if nav_rgb is not None:
-                detection_result, bottle_positions, cup_positions = self.detect_objects(nav_rgb, nav_depth)
-            else:
-                detection_result = None
-            
-            # Update displays using visualization manager
-            self.visualizer.show_camera_feed('Navigation Camera (RGB)', nav_rgb, 'rgb')
-            self.visualizer.show_camera_feed('Navigation Camera (Depth)', nav_depth, 'depth')
-            self.visualizer.show_camera_feed('Manipulation Camera (RGB)', manip_rgb, 'rgb')
-            self.visualizer.show_camera_feed('Manipulation Camera (Depth)', manip_depth, 'depth')
-            
-            if detection_result is not None:
-                self.visualizer.show_camera_feed('Object Detection', detection_result, 'rgb')
-            
-            if lidar_data is not None:
-                ranges, angles, hit_objects = lidar_data
-                self.visualizer.show_lidar_view(ranges, angles, hit_objects, self.lidar_range)
-                
-        except Exception as e:
-            print(f"Error updating sensor data: {e}")
+        """Update all sensor displays - delegated to VisualizationManager"""
+        self.visualizer.update_all_displays(self)
     
     def get_bottle_position(self):
         """Get estimated bottle position from camera data"""
@@ -150,3 +150,43 @@ class SensorManager:
     def destroy_windows(self):
         """Clean up visualization windows"""
         self.visualizer.cleanup()
+    
+    def get_room_map(self):
+        """Generate a simple room map from LiDAR data"""
+        # Get current LiDAR data
+        ranges, angles, hit_objects = self.get_lidar_data()
+        
+        # Create a simple occupancy grid map
+        map_size = 400  # 400x400 pixel map
+        map_img = np.ones((map_size, map_size, 3), dtype=np.uint8) * 128  # Gray background
+        center = (map_size // 2, map_size // 2)
+        scale = map_size / (2 * self.lidar_range)
+        
+        # Convert LiDAR points to map coordinates
+        x_coords = ranges * np.cos(angles)
+        y_coords = ranges * np.sin(angles)
+        
+        # Mark occupied cells
+        for i, (x, y, range_val) in enumerate(zip(x_coords, y_coords, ranges)):
+            if range_val < self.lidar_range:  # Valid hit
+                map_x = int(x * scale + center[0])
+                map_y = int(y * scale + center[1])
+                
+                if 0 <= map_x < map_size and 0 <= map_y < map_size:
+                    # Draw occupied cell
+                    cv2.circle(map_img, (map_x, map_y), 2, (0, 0, 0), -1)  # Black for obstacles
+        
+        # Draw robot position
+        cv2.circle(map_img, center, 5, (0, 0, 255), -1)  # Red for robot
+        cv2.arrowedLine(map_img, center, (center[0] + 15, center[1]), (0, 0, 255), 2)
+        
+        # Add grid lines
+        for i in range(0, map_size, 40):
+            cv2.line(map_img, (i, 0), (i, map_size), (200, 200, 200), 1)
+            cv2.line(map_img, (0, i), (map_size, i), (200, 200, 200), 1)
+        
+        # Add title
+        cv2.putText(map_img, 'Room Map', (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(map_img, f'Scale: {self.lidar_range}m', (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        
+        return map_img

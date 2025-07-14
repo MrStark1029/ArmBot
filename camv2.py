@@ -3,12 +3,15 @@ import pybullet_data
 import numpy as np
 import cv2
 import time
+import math
 import os
+import gc
 from teleop import HuskyTeleopController
+from autonomous_nav import RobotController
 from sensor import SensorManager
 
 # === Connect and Setup ===
-physicsClient = p.connect(p.GUI)
+p.connect(p.GUI)
 p.setGravity(0, 0, -9.8)
 p.setAdditionalSearchPath(pybullet_data.getDataPath())
 p.loadURDF("plane.urdf")
@@ -45,13 +48,6 @@ husky_path = os.path.join(pybullet_data.getDataPath(), "husky/husky.urdf")
 husky_pos = [2.0, 1.0, 0.1]
 husky_id = p.loadURDF(husky_path, basePosition=husky_pos, useFixedBase=False)
 
-# === Initialize Controller ===
-# This is the key change - controller handles all movement logic
-controller = HuskyTeleopController(husky_id)
-
-# === Initialize Sensor Manager ===
-sensor_manager = SensorManager(husky_id)
-
 # === Mount Franka on Husky ===
 panda_path = os.path.join(pybullet_data.getDataPath(), "franka_panda/panda.urdf")
 panda_offset = [0.0, 0.0, 0.45]
@@ -75,7 +71,7 @@ for j in range(p.getNumJoints(panda_id)):
     if joint_info[2] in [p.JOINT_REVOLUTE, p.JOINT_PRISMATIC]:
         p.setJointMotorControl2(panda_id, j, p.POSITION_CONTROL, targetPosition=0, force=500)
 
-# === Build Rigid Table ===
+# === Build Rigid Table (1 body) ===
 table_pos = [12, 1, 0]
 table_top_size = [0.5, 0.3, 0.025]
 leg_height = 0.675
@@ -140,7 +136,26 @@ cup_vis = p.createVisualShape(p.GEOM_CYLINDER, radius=cup_radius, length=cup_hei
                               rgbaColor=[1.0, 0.9, 0.7, 1])
 cup_id = p.createMultiBody(0.2, cup_col, cup_vis, cup_pos)
 
-# === Camera View ===
+# === Control Mode Setup ===
+MANUAL_MODE = 'manual'
+AUTONOMOUS_MODE = 'autonomous'
+current_mode = MANUAL_MODE
+
+# Initialize controllers
+sensor_manager = SensorManager(husky_id)
+teleop_controller = HuskyTeleopController(husky_id)
+autonomous_controller = RobotController(husky_id, sensor_manager)
+
+# Print controls
+print("\n=== Robot Control Modes ===")
+print("Press 'M' for manual control mode")
+print("Press 'A' for autonomous mode")
+print("Press 'ESC' to quit")
+teleop_controller.print_controls()
+
+# === Sensor Functions - Delegated to SensorManager ===
+
+# === Camera View (full environment) ===
 p.resetDebugVisualizerCamera(
     cameraDistance=20,
     cameraYaw=45,
@@ -149,35 +164,73 @@ p.resetDebugVisualizerCamera(
 )
 
 # === Main Loop ===
-UPDATE_FREQ = 2
+UPDATE_FREQ = 4  # Update sensors every N simulation steps
 step_count = 0
 
+# Enable garbage collection for better memory management
+gc.enable()
+last_collection = time.time()
+
 try:
-    # Controller handles all input and movement logic
-    controller.print_controls()
-    
     while True:
-        # Controller processes input and updates robot movement
-        should_exit = controller.process_input()
-        if should_exit:
-            break
-            
-        # Step simulation
         p.stepSimulation()
+        
+        # Process keyboard input for mode switching
+        key = None
+        if cv2.waitKey(1) & 0xFF == ord('m'):
+            if current_mode != MANUAL_MODE:
+                print("Switching to manual control mode")
+                current_mode = MANUAL_MODE
+                autonomous_controller.stop()  # Stop autonomous movement
+                teleop_controller.print_controls()
+        elif cv2.waitKey(1) & 0xFF == ord('x'):
+            if current_mode != AUTONOMOUS_MODE:
+                print("Switching to autonomous mode")
+                current_mode = AUTONOMOUS_MODE
+                teleop_controller.stop()  # Stop manual movement
+        
+        # Handle control based on current mode
+        if current_mode == MANUAL_MODE:
+            # Process manual control input
+            if teleop_controller.process_input():
+                break  # Exit if ESC pressed
+        else:  # Autonomous mode
+            # Run autonomous navigation step
+            if not autonomous_controller.update():
+                print("Autonomous navigation complete or failed")
+                current_mode = MANUAL_MODE
+                teleop_controller.print_controls()
         
         # Update sensor displays at reduced frequency
         if step_count % UPDATE_FREQ == 0:
-            sensor_manager.update_displays()
+            try:
+                # Update all displays using SensorManager
+                sensor_manager.update_displays()
+                
+            except Exception as e:
+                print(f"Error updating sensor data: {e}")
         
+        # Periodic garbage collection
+        if time.time() - last_collection > 60:  # Every minute
+            gc.collect()
+            last_collection = time.time()
+        
+        # Handle window close
         if cv2.waitKey(1) & 0xFF == 27:  # ESC key
             break
         
         step_count += 1
-        time.sleep(1./360.)
+        time.sleep(1./240.)  # Adjusted for better performance
 
 except KeyboardInterrupt:
     print("\nSimulation stopped by user")
 finally:
-    controller.stop()
-    sensor_manager.destroy_windows()
+    # Stop any movement
+    teleop_controller.stop()
+    autonomous_controller.stop()
+    
+    # Cleanup
+    sensor_manager.destroy_windows()  # Use SensorManager cleanup
     p.disconnect()
+    cv2.destroyAllWindows()
+    gc.collect()  # Final cleanup
