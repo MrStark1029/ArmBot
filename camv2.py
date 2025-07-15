@@ -4,12 +4,42 @@ import numpy as np
 import cv2
 import time
 import math
+import json
 import os
 import gc
 from teleop import HuskyTeleopController
 from autonomous_nav import RobotController
 from sensor import SensorManager
 from mode_controller import ModeController
+
+def load_walls_from_json(filepath="housev1.json"):
+    with open(filepath, "r") as f:
+        data = json.load(f)
+
+    # ✅ Pull the actual wall list
+    walls = data["walls"]
+
+    for wall in walls:
+        half_extents = wall["half_extents"]
+        position = wall["position"]
+        rotation_deg = wall.get("rotation", 0)
+        # Force all walls to be invisible
+        color = [1, 1, 1, 0]
+
+        orientation = p.getQuaternionFromEuler([0, 0, math.radians(rotation_deg)])
+
+        col = p.createCollisionShape(p.GEOM_BOX, halfExtents=half_extents)
+        vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.001, 0.001, 0.001])
+        p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=col,
+            baseVisualShapeIndex=vis,
+            basePosition=position,
+            baseOrientation=orientation
+        )
+
+    print(f"✅ Loaded {len(walls)} walls from {filepath}")
+
 
 # === Connect and Setup ===
 p.connect(p.GUI)
@@ -40,6 +70,7 @@ p.createMultiBody(
     basePosition=[0, 0, -0.5]
 )
 
+load_walls_from_json("E:/ArmBot/Mythings/Models/housev1.json")
 # === Load Fridge ===
 fridge_path = "E:/ArmBot/Mythings/Models/Fridge/11299/mobility.urdf"
 fridge_id = p.loadURDF(fridge_path, basePosition=[15, 18, 0.8], useFixedBase=True)
