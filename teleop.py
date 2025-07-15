@@ -33,6 +33,9 @@ class HuskyTeleopController:
         self.current_linear_vel = 0.0
         self.current_angular_vel = 0.0
         
+        # Enable/disable state for mode switching
+        self.enabled = False
+        
         # Key state tracking for smooth movement
         self.key_states = {
             'w': False, 's': False, 'a': False, 'd': False,
@@ -119,6 +122,10 @@ class HuskyTeleopController:
     
     def process_input(self):
         """Process keyboard input and update robot movement. Returns True if should exit."""
+        # Don't process input if not enabled
+        if not self.enabled:
+            return False
+            
         key = self.get_key()
         current_time = time.time()
         movement_updated = False
@@ -212,3 +219,19 @@ class HuskyTeleopController:
         print(f"Current Linear Speed: {self.current_linear_speed:.1f} m/s")
         print(f"Current Angular Speed: {self.current_angular_speed:.1f} rad/s")
         print("="*50)
+        
+    def set_enabled(self, enabled):
+        """Enable or disable teleop control"""
+        self.enabled = enabled
+        if not enabled:
+            # Stop all movement when disabled
+            self.stop()
+            # Reset all key states
+            for key in self.key_states:
+                self.key_states[key] = False
+            self.current_linear_vel = 0.0
+            self.current_angular_vel = 0.0
+        
+    def is_enabled(self):
+        """Check if teleop control is enabled"""
+        return self.enabled

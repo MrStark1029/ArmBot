@@ -9,6 +9,7 @@ import gc
 from teleop import HuskyTeleopController
 from autonomous_nav import RobotController
 from sensor import SensorManager
+from mode_controller import ModeController
 
 # === Connect and Setup ===
 p.connect(p.GUI)
@@ -136,24 +137,21 @@ cup_vis = p.createVisualShape(p.GEOM_CYLINDER, radius=cup_radius, length=cup_hei
                               rgbaColor=[1.0, 0.9, 0.7, 1])
 cup_id = p.createMultiBody(0.2, cup_col, cup_vis, cup_pos)
 
-# === Control Mode Setup ===
-MANUAL_MODE = 'manual'
-AUTONOMOUS_MODE = 'autonomous'
-current_mode = MANUAL_MODE
-
-# Initialize controllers
+# === Initialize Controllers ===
 sensor_manager = SensorManager(husky_id)
 teleop_controller = HuskyTeleopController(husky_id)
 autonomous_controller = RobotController(husky_id, sensor_manager)
+mode_controller = ModeController()
 
-# Print controls
-print("\n=== Robot Control Modes ===")
-print("Press 'M' for manual control mode")
-print("Press 'A' for autonomous mode")
-print("Press 'ESC' to quit")
+# Start in manual mode
+current_mode = 'manual'
+teleop_controller.set_enabled(True)
+autonomous_controller.set_enabled(False)  # Properly disable autonomous controller initially
+
+print("\n=== Robot Control System Initialized ===")
+print("Use the Mode Controller window to switch between modes")
+print("Starting in MANUAL mode")
 teleop_controller.print_controls()
-
-# === Sensor Functions - Delegated to SensorManager ===
 
 # === Camera View (full environment) ===
 p.resetDebugVisualizerCamera(
@@ -175,31 +173,50 @@ try:
     while True:
         p.stepSimulation()
         
-        # Process keyboard input for mode switching
-        key = None
-        if cv2.waitKey(1) & 0xFF == ord('m'):
-            if current_mode != MANUAL_MODE:
-                print("Switching to manual control mode")
-                current_mode = MANUAL_MODE
-                autonomous_controller.stop()  # Stop autonomous movement
-                teleop_controller.print_controls()
-        elif cv2.waitKey(1) & 0xFF == ord('x'):
-            if current_mode != AUTONOMOUS_MODE:
-                print("Switching to autonomous mode")
-                current_mode = AUTONOMOUS_MODE
-                teleop_controller.stop()  # Stop manual movement
+        # Check mode controller for mode changes
+        if mode_controller.update():
+            new_mode = mode_controller.get_current_mode()
+            
+            if mode_controller.should_exit():
+                print("Exit requested from mode controller")
+                break
+            
+            if new_mode != current_mode:
+                print(f"Mode changed from {current_mode} to {new_mode}")
+                
+                # Stop both controllers first
+                teleop_controller.set_enabled(False)
+                autonomous_controller.set_enabled(False)
+                
+                # Wait a moment to ensure complete stop
+                time.sleep(0.1)
+                
+                # Switch to new mode
+                current_mode = new_mode
+                
+                if current_mode == 'manual':
+                    print("Enabling manual control...")
+                    teleop_controller.set_enabled(True)
+                    teleop_controller.print_controls()
+                elif current_mode == 'autonomous':
+                    print("Enabling autonomous control...")
+                    autonomous_controller.set_enabled(True)
         
         # Handle control based on current mode
-        if current_mode == MANUAL_MODE:
+        if current_mode == 'manual':
             # Process manual control input
             if teleop_controller.process_input():
-                break  # Exit if ESC pressed
-        else:  # Autonomous mode
+                break  # Exit if ESC pressed in teleop
+        elif current_mode == 'autonomous':
             # Run autonomous navigation step
-            if not autonomous_controller.update():
-                print("Autonomous navigation complete or failed")
-                current_mode = MANUAL_MODE
-                teleop_controller.print_controls()
+            try:
+                if not autonomous_controller.update():
+                    print("Autonomous navigation complete or failed")
+                    # Don't automatically switch back to manual
+                    # Let user choose via mode controller
+            except Exception as e:
+                print(f"Error in autonomous controller: {e}")
+                # Don't automatically switch modes on error
         
         # Update sensor displays at reduced frequency
         if step_count % UPDATE_FREQ == 0:
@@ -215,22 +232,21 @@ try:
             gc.collect()
             last_collection = time.time()
         
-        # Handle window close
-        if cv2.waitKey(1) & 0xFF == 27:  # ESC key
-            break
-        
         step_count += 1
         time.sleep(1./240.)  # Adjusted for better performance
 
 except KeyboardInterrupt:
     print("\nSimulation stopped by user")
 finally:
-    # Stop any movement
+    # Stop any movement and disable controllers
+    teleop_controller.set_enabled(False)
     teleop_controller.stop()
+    autonomous_controller.set_enabled(False)
     autonomous_controller.stop()
     
     # Cleanup
-    sensor_manager.destroy_windows()  # Use SensorManager cleanup
+    sensor_manager.destroy_windows()
+    mode_controller.destroy()
     p.disconnect()
     cv2.destroyAllWindows()
     gc.collect()  # Final cleanup

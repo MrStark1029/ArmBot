@@ -25,8 +25,33 @@ class RobotController:
         self.path_index = 0
         self.planner = None  # Will be initialized when needed
         
+        # Control state for mode switching
+        self.enabled = False
+        self.running = False
+        
+    def set_enabled(self, enabled):
+        """Enable or disable autonomous navigation"""
+        self.enabled = enabled
+        if not enabled:
+            self.stop()
+            self.running = False
+        else:
+            self.running = True
+            
+    def is_enabled(self):
+        """Check if autonomous navigation is enabled"""
+        return self.enabled
+        
+    def is_running(self):
+        """Check if autonomous navigation is currently running"""
+        return self.running
+        
     def update(self):
         """Main update loop for autonomous navigation"""
+        # Don't run if not enabled
+        if not self.enabled:
+            return True  # Nothing to do if not enabled
+        
         # Update SLAM
         self.slam.step()
         
@@ -35,6 +60,7 @@ class RobotController:
             self.current_target = self.slam.get_next_frontier()
             if self.current_target is None:
                 print("Exploration complete!")
+                self.running = False
                 return False
             
             # Plan path to new target
@@ -130,10 +156,17 @@ class RobotController:
         return np.hypot(dx, dy) < self.pos_threshold
     
     def stop(self):
-        """Stop robot movement"""
+        """Stop robot movement and clear navigation state"""
+        # Stop all wheel movement
         p.setJointMotorControlArray(
             self.robot_id,
             [0, 1, 2, 3],
             p.VELOCITY_CONTROL,
             targetVelocities=[0] * 4
         )
+        
+        # Clear navigation state
+        self.running = False
+        self.current_path = []
+        self.current_target = None
+        self.path_index = 0
