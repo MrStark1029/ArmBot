@@ -3,7 +3,6 @@ import numpy as np
 from queue import PriorityQueue
 import time
 import cv2
-from pathplanner import AStarPlanner
 
 class AutonomousNavigator:
     def __init__(self, robot_id, sensor_manager):
@@ -23,35 +22,55 @@ class AutonomousNavigator:
 
     def get_robot_pose(self):
         """Get robot's pose in world and grid coordinates."""
-        pos, orn = p.getBasePositionAndOrientation(self.robot_id)
-        x, y = pos[0], pos[1]
-        grid_x = int(x / self.cell_size) + self.map_center
-        grid_y = int(y / self.cell_size) + self.map_center
-        return (x, y), (grid_x, grid_y), orn
+        try:
+            pos, orn = p.getBasePositionAndOrientation(self.robot_id)
+            x, y = pos[0], pos[1]
+            grid_x = int(x / self.cell_size) + self.map_center
+            grid_y = int(y / self.cell_size) + self.map_center
+            
+            # Ensure grid coordinates are within bounds
+            grid_x = max(0, min(self.map_size - 1, grid_x))
+            grid_y = max(0, min(self.map_size - 1, grid_y))
+            
+            return (x, y), (grid_x, grid_y), orn
+        except Exception as e:
+            print(f"Error getting robot pose: {e}")
+            return (0, 0), (self.map_center, self.map_center), (0, 0, 0, 1)
 
     def update_map(self):
         """Update occupancy map using LiDAR data."""
-        (x, y), (gx, gy), _ = self.get_robot_pose()
-        self.visited.add((gx, gy))
+        try:
+            (x, y), (gx, gy), _ = self.get_robot_pose()
+            self.visited.add((gx, gy))
 
-        lidar_data = self.sensor_manager.get_lidar_data()
-        if lidar_data is None:
-            return
+            lidar_data = self.sensor_manager.get_lidar_data()
+            if lidar_data is None or len(lidar_data) < 2:
+                print("Invalid or missing LiDAR data.")
+                return
 
-        ranges, angles, _ = lidar_data
+            ranges = np.asarray(lidar_data[0])
+            angles = np.asarray(lidar_data[1])
 
-        for r, a in zip(ranges, angles):
-            if r < self.sensor_manager.lidar_range:
-                wx = x + r * np.cos(a)
-                wy = y + r * np.sin(a)
-                gx1 = int(wx / self.cell_size) + self.map_center
-                gy1 = int(wy / self.cell_size) + self.map_center
+            if ranges.shape != angles.shape:
+                print(f"Mismatch in LiDAR data shapes: ranges={ranges.shape}, angles={angles.shape}")
+                return
 
-                if 0 <= gx1 < self.map_size and 0 <= gy1 < self.map_size:
-                    self.occupancy_grid[gy1, gx1] = 1
-                    self._mark_line_as_free(gx, gy, gx1, gy1)
+            for r, a in zip(ranges, angles):
+                if r < self.sensor_manager.lidar_max_range:
+                    wx = x + r * np.cos(a)
+                    wy = y + r * np.sin(a)
+                    gx1 = int(wx / self.cell_size) + self.map_center
+                    gy1 = int(wy / self.cell_size) + self.map_center
 
-        self._update_frontiers()
+                    if 0 <= gx1 < self.map_size and 0 <= gy1 < self.map_size:
+                        self.occupancy_grid[gy1, gx1] = 1
+                        self._mark_line_as_free(gx, gy, gx1, gy1)
+
+            self._update_frontiers()
+
+        except Exception as e:
+            print(f"Error updating map: {e}")
+
 
     def _mark_line_as_free(self, x0, y0, x1, y1):
         """Bresenham's line algorithm to mark free space."""
@@ -85,41 +104,54 @@ class AutonomousNavigator:
 
     def get_next_frontier(self):
         """Return the closest unexplored frontier."""
-        (_, _), (gx, gy), _ = self.get_robot_pose()
-        min_dist = float('inf')
-        nearest = None
-        for fx, fy in self.frontiers:
-            if (fx, fy) not in self.visited:
-                d = np.hypot(fx - gx, fy - gy)
-                if d < min_dist:
-                    min_dist = d
-                    nearest = (fx, fy)
-        if nearest:
-            wx = (nearest[0] - self.map_center) * self.cell_size
-            wy = (nearest[1] - self.map_center) * self.cell_size
-            return (wx, wy)
-        return None
+        try:
+            (_, _), (gx, gy), _ = self.get_robot_pose()
+            
+            if not self.frontiers:
+                return None
+                
+            min_dist = float('inf')
+            nearest = None
+            for fx, fy in self.frontiers:
+                if (fx, fy) not in self.visited:
+                    d = np.hypot(fx - gx, fy - gy)
+                    if d < min_dist:
+                        min_dist = d
+                        nearest = (fx, fy)
+            if nearest:
+                wx = (nearest[0] - self.map_center) * self.cell_size
+                wy = (nearest[1] - self.map_center) * self.cell_size
+                return (wx, wy)
+            return None
+        except Exception as e:
+            print(f"Error getting next frontier: {e}")
+            return None
 
     def visualize_map(self):
         """Visualize SLAM map in OpenCV."""
-        vis_map = np.zeros((self.map_size, self.map_size, 3), dtype=np.uint8)
-        vis_map[self.occupancy_grid == 1] = [0, 0, 255]
-        vis_map[self.occupancy_grid == -1] = [255, 255, 255]
-        vis_map[self.occupancy_grid == 0] = [50, 50, 50]
+        try:
+            vis_map = np.zeros((self.map_size, self.map_size, 3), dtype=np.uint8)
+            vis_map[self.occupancy_grid == 1] = [0, 0, 255]
+            vis_map[self.occupancy_grid == -1] = [255, 255, 255]
+            vis_map[self.occupancy_grid == 0] = [50, 50, 50]
 
-        for vx, vy in self.visited:
-            vis_map[vy, vx] = [0, 255, 0]
+            for vx, vy in self.visited:
+                if 0 <= vx < self.map_size and 0 <= vy < self.map_size:
+                    vis_map[vy, vx] = [0, 255, 0]
 
-        for fx, fy in self.frontiers:
-            vis_map[fy, fx] = [255, 0, 255]
+            for fx, fy in self.frontiers:
+                if 0 <= fx < self.map_size and 0 <= fy < self.map_size:
+                    vis_map[fy, fx] = [255, 0, 255]
 
-        _, (gx, gy), _ = self.get_robot_pose()
-        if 0 <= gx < self.map_size and 0 <= gy < self.map_size:
-            cv2.circle(vis_map, (gx, gy), 3, (0, 255, 255), -1)
+            _, (gx, gy), _ = self.get_robot_pose()
+            if 0 <= gx < self.map_size and 0 <= gy < self.map_size:
+                cv2.circle(vis_map, (gx, gy), 3, (0, 255, 255), -1)
 
-        vis_map = cv2.resize(vis_map, (self.map_size * 2, self.map_size * 2))
-        cv2.imshow("Simulated SLAM Map", vis_map)
-        cv2.waitKey(1)
+            vis_map = cv2.resize(vis_map, (self.map_size * 2, self.map_size * 2))
+            cv2.imshow("Simulated SLAM Map", vis_map)
+            cv2.waitKey(1)
+        except Exception as e:
+            print(f"Error visualizing map: {e}")
 
     def step(self):
         """Run one SLAM update step."""
