@@ -4,7 +4,7 @@ import time
 import cv2
 import math
 
-class RobotController:
+class LiDARNavigator:
     def __init__(self, robot_id, sensor_manager):
         self.robot_id = robot_id
         self.sensor_manager = sensor_manager
@@ -12,7 +12,7 @@ class RobotController:
         # Robot control parameters
         self.forward_speed = 1.0
         self.turning_speed = 0.8
-        self.safe_distance = 1.2  # meters - minimum distance to obstacles
+        self.safe_distance = 1.0  # meters - minimum distance to obstacles
         
         # Navigation state
         self.enabled = False
@@ -28,12 +28,8 @@ class RobotController:
         self.robot_trail = []
         self.max_trail_length = 1000
         
-        # Last command time for rate limiting
-        self.last_command_time = time.time()
-        self.min_command_interval = 0.1
-        
     def set_enabled(self, enabled):
-        """Enable or disable autonomous navigation"""
+        """Enable or disable navigation"""
         self.enabled = enabled
         if not enabled:
             self.stop()
@@ -42,23 +38,15 @@ class RobotController:
             self.running = True
             
     def is_enabled(self):
-        """Check if autonomous navigation is enabled"""
         return self.enabled
         
     def is_running(self):
-        """Check if autonomous navigation is currently running"""
         return self.running
         
     def update(self):
-        """Main navigation loop using LiDAR reactive navigation"""
+        """Main navigation loop"""
         if not self.enabled:
             return True
-            
-        # Rate limit commands
-        current_time = time.time()
-        if current_time - self.last_command_time < self.min_command_interval:
-            return True
-        self.last_command_time = current_time
             
         try:
             # Get robot pose
@@ -74,22 +62,20 @@ class RobotController:
             
             # Get LiDAR data
             lidar_data = self.sensor_manager.get_lidar_data()
-            ranges = lidar_data[0]
-            relative_angles = lidar_data[1]
-            
-            # Generate absolute angles from 0 to 2π
-            num_rays = len(ranges)
-            angles = np.linspace(0, 2*np.pi, num_rays, endpoint=False)
+            ranges = lidar_data['ranges']
+            angles = np.linspace(0, 2*np.pi, len(ranges), endpoint=False)
             
             # Update occupancy map with LiDAR data
             self.update_occupancy_map(robot_x, robot_y, robot_theta, ranges, angles)
             
-            # Reactive LiDAR navigation
-            target_direction = self.find_free_space_direction(robot_x, robot_y, robot_theta, ranges, angles)
+            # Find navigation direction
+            target_direction = self.find_navigation_direction(robot_x, robot_y, robot_theta, ranges, angles)
             
             if target_direction is not None:
+                # Navigate towards target direction
                 self.navigate_to_direction(robot_theta, target_direction)
             else:
+                # No clear direction, turn to explore
                 self.explore_turn()
                 
             # Visualize
@@ -99,86 +85,13 @@ class RobotController:
             print(f"Navigation error: {e}")
             
         return True
-    
-    def find_free_space_direction(self, robot_x, robot_y, robot_theta, ranges, angles):
-        """Find the best direction to navigate based on LiDAR free space"""
-        # Divide LiDAR scan into sectors and find the most open direction
-        num_sectors = 16  # 22.5 degrees per sector
-        sector_size = len(ranges) // num_sectors
-        sector_scores = []
         
-        for sector in range(num_sectors):
-            start_idx = sector * sector_size
-            end_idx = min((sector + 1) * sector_size, len(ranges))
-            
-            # Get ranges in this sector
-            sector_ranges = ranges[start_idx:end_idx]
-            sector_angles = angles[start_idx:end_idx]
-            
-            # Calculate score for this sector
-            min_distance = np.min(sector_ranges)
-            avg_distance = np.mean(sector_ranges)
-            
-            # Score based on safety and openness
-            if min_distance > self.safe_distance:
-                # Safe to go in this direction
-                score = avg_distance * 10  # Base score from openness
-                
-                # Bonus for unexplored areas (check occupancy map)
-                sector_angle = robot_theta + np.mean(sector_angles)
-                
-                # Check multiple points ahead for exploration bonus
-                for check_dist in [2.0, 3.0, 4.0]:
-                    check_x = robot_x + check_dist * math.cos(sector_angle)
-                    check_y = robot_y + check_dist * math.sin(sector_angle)
-                    check_map_x, check_map_y = self.world_to_map(check_x, check_y)
-                    
-                    if (0 <= check_map_x < self.map_size and 0 <= check_map_y < self.map_size):
-                        if self.occupancy_map[check_map_y, check_map_x] > 0.3:  # Unexplored
-                            score += 5.0  # Bonus for unexplored areas
-                
-                # Prefer directions closer to forward - stronger preference to avoid oscillation
-                relative_angle = np.mean(sector_angles)
-                forward_bonus = math.cos(relative_angle) * 8.0  # Increased forward bias
-                score += forward_bonus
-                
-                # Penalize directions that require very large turns
-                angle_diff = abs(relative_angle)
-                if angle_diff > math.pi:
-                    angle_diff = 2 * math.pi - angle_diff
-                
-                if angle_diff > math.pi/2:  # More than 90 degrees
-                    score *= 0.3  # Heavy penalty for large turns
-                elif angle_diff > math.pi/3:  # More than 60 degrees  
-                    score *= 0.6  # Medium penalty
-                        
-            else:
-                score = 0  # Not safe
-                
-            sector_angle = robot_theta + np.mean(sector_angles)
-            sector_scores.append((sector, score, sector_angle))
-        
-        # Find best sector
-        sector_scores.sort(key=lambda x: x[1], reverse=True)
-        
-        if sector_scores[0][1] > 0:
-            best_sector_angle = sector_scores[0][2]
-            relative_angle = best_sector_angle - robot_theta
-            while relative_angle > math.pi:
-                relative_angle -= 2 * math.pi
-            while relative_angle < -math.pi:
-                relative_angle += 2 * math.pi
-            print(f"Target direction: {np.degrees(relative_angle):.1f}° relative, score: {sector_scores[0][1]:.1f}")
-            return best_sector_angle
-        else:
-            return None
-    
     def update_occupancy_map(self, robot_x, robot_y, robot_theta, ranges, angles):
         """Update occupancy map with current LiDAR scan"""
         robot_map_x, robot_map_y = self.world_to_map(robot_x, robot_y)
         
         # Clear area around robot
-        cv2.circle(self.occupancy_map, (robot_map_x, robot_map_y), 8, 0.1, -1)
+        cv2.circle(self.occupancy_map, (robot_map_x, robot_map_y), 5, 0.1, -1)
         
         for i, (range_m, angle) in enumerate(zip(ranges, angles)):
             if range_m >= self.sensor_manager.lidar_max_range * 0.95:
@@ -194,15 +107,63 @@ class RobotController:
             # Mark obstacle if within range
             if range_m < self.sensor_manager.lidar_max_range * 0.95:
                 if (0 <= end_map_x < self.map_size and 0 <= end_map_y < self.map_size):
-                    cv2.circle(self.occupancy_map, (end_map_x, end_map_y), 3, 1.0, -1)
+                    cv2.circle(self.occupancy_map, (end_map_x, end_map_y), 2, 1.0, -1)
             
             # Mark free space along ray
             if (0 <= end_map_x < self.map_size and 0 <= end_map_y < self.map_size):
-                cv2.line(self.occupancy_map, (robot_map_x, robot_map_y), (end_map_x, end_map_y), 0.05, 1)
+                cv2.line(self.occupancy_map, (robot_map_x, robot_map_y), (end_map_x, end_map_y), 0.1, 1)
+    
+    def find_navigation_direction(self, robot_x, robot_y, robot_theta, ranges, angles):
+        """Find the best direction to navigate based on LiDAR data"""
+        # Analyze LiDAR data to find free space directions
+        sector_size = len(ranges) // 12  # Divide into 12 sectors (30 degrees each)
+        sector_scores = []
+        
+        for sector in range(12):
+            start_idx = sector * sector_size
+            end_idx = min((sector + 1) * sector_size, len(ranges))
+            
+            # Get ranges in this sector
+            sector_ranges = ranges[start_idx:end_idx]
+            sector_angles = angles[start_idx:end_idx]
+            
+            # Calculate score for this sector
+            min_distance = np.min(sector_ranges)
+            avg_distance = np.mean(sector_ranges)
+            
+            # Score based on distance and exploration potential
+            if min_distance > self.safe_distance:
+                # Safe to go in this direction
+                score = avg_distance
+                
+                # Bonus for unexplored areas (check occupancy map)
+                sector_angle = robot_theta + np.mean(sector_angles)
+                check_distance = 3.0  # Look ahead 3 meters
+                check_x = robot_x + check_distance * math.cos(sector_angle)
+                check_y = robot_y + check_distance * math.sin(sector_angle)
+                check_map_x, check_map_y = self.world_to_map(check_x, check_y)
+                
+                if (0 <= check_map_x < self.map_size and 0 <= check_map_y < self.map_size):
+                    if self.occupancy_map[check_map_y, check_map_x] > 0.4:  # Unexplored
+                        score += 2.0  # Bonus for unexplored areas
+                        
+            else:
+                score = 0  # Not safe
+                
+            sector_scores.append((sector, score, sector_angle))
+        
+        # Find best sector
+        sector_scores.sort(key=lambda x: x[1], reverse=True)
+        
+        if sector_scores[0][1] > 0:
+            best_sector_angle = sector_scores[0][2]
+            return best_sector_angle
+        else:
+            return None
     
     def navigate_to_direction(self, current_angle, target_angle):
         """Navigate robot towards target direction"""
-        # Calculate angle difference (shortest path)
+        # Calculate angle difference
         angle_diff = target_angle - current_angle
         while angle_diff > np.pi:
             angle_diff -= 2 * np.pi
@@ -210,28 +171,19 @@ class RobotController:
             angle_diff += 2 * np.pi
             
         # Control logic
-        if abs(angle_diff) > 0.3:  # Need to turn (about 17 degrees)
-            # Mix turning with forward motion for smoother navigation
-            turn_speed = min(abs(angle_diff) * 0.6, self.turning_speed) * np.sign(angle_diff)
-            forward_speed = self.forward_speed * 0.3  # Slow forward motion while turning
+        if abs(angle_diff) > 0.2:  # Need to turn
+            turn_speed = self.turning_speed * np.sign(angle_diff)
+            turn_speed = max(-self.turning_speed, min(self.turning_speed, turn_speed))
             
-            # Differential drive
-            left_speed = forward_speed - turn_speed
-            right_speed = forward_speed + turn_speed
-            
-            # Clamp speeds
-            left_speed = max(-self.forward_speed, min(self.forward_speed, left_speed))
-            right_speed = max(-self.forward_speed, min(self.forward_speed, right_speed))
-            
-            print(f"Mixed motion: angle_diff={np.degrees(angle_diff):.1f}°, left={left_speed:.2f}, right={right_speed:.2f}")
+            print(f"Turning: {np.degrees(angle_diff):.1f}° at speed {turn_speed:.2f}")
             p.setJointMotorControlArray(
                 self.robot_id,
                 [2, 4, 3, 5],
                 p.VELOCITY_CONTROL,
-                targetVelocities=[left_speed, left_speed, right_speed, right_speed]
+                targetVelocities=[-turn_speed, -turn_speed, turn_speed, turn_speed]
             )
         else:
-            # Move forward - direction is good
+            # Move forward
             speed = self.forward_speed
             print(f"Moving forward at speed {speed:.2f}")
             p.setJointMotorControlArray(
@@ -243,7 +195,7 @@ class RobotController:
     
     def explore_turn(self):
         """Turn to explore when no clear direction is found"""
-        print("No clear path, exploring by turning...")
+        print("No clear direction, exploring...")
         turn_speed = self.turning_speed * 0.5
         p.setJointMotorControlArray(
             self.robot_id,
@@ -265,7 +217,7 @@ class RobotController:
         return world_x, world_y
     
     def visualize_navigation(self, robot_x, robot_y, robot_theta, ranges, angles, target_direction):
-        """Visualize the LiDAR-based navigation"""
+        """Visualize the navigation state"""
         # Create visualization
         vis_map = np.zeros((self.map_size, self.map_size, 3), dtype=np.uint8)
         
@@ -284,7 +236,7 @@ class RobotController:
         # Draw robot trail
         if len(self.robot_trail) > 1:
             trail_points = []
-            for tx, ty in self.robot_trail[-100:]:  # Show last 100 points
+            for tx, ty in self.robot_trail:
                 map_x, map_y = self.world_to_map(tx, ty)
                 if 0 <= map_x < self.map_size and 0 <= map_y < self.map_size:
                     trail_points.append((map_x, map_y))
@@ -304,41 +256,29 @@ class RobotController:
             
             # Draw target direction if available
             if target_direction is not None:
-                target_end_x = robot_map_x + int(40 * math.cos(target_direction))
-                target_end_y = robot_map_y + int(40 * math.sin(target_direction))
-                cv2.arrowedLine(vis_map, (robot_map_x, robot_map_y), (target_end_x, target_end_y), (255, 255, 0), 3)
+                target_end_x = robot_map_x + int(30 * math.cos(target_direction))
+                target_end_y = robot_map_y + int(30 * math.sin(target_direction))
+                cv2.arrowedLine(vis_map, (robot_map_x, robot_map_y), (target_end_x, target_end_y), (255, 255, 0), 2)
         
-        # Draw LiDAR rays showing free space
+        # Draw LiDAR rays
         for i, (range_m, angle) in enumerate(zip(ranges, angles)):
-            if i % 8 == 0:  # Draw every 8th ray for clarity
+            if i % 4 == 0:  # Draw every 4th ray for clarity
                 world_angle = robot_theta + angle
-                end_x = robot_x + min(range_m, 6.0) * math.cos(world_angle)  # Limit display range
-                end_y = robot_y + min(range_m, 6.0) * math.sin(world_angle)
+                end_x = robot_x + min(range_m, 5.0) * math.cos(world_angle)  # Limit display range
+                end_y = robot_y + min(range_m, 5.0) * math.sin(world_angle)
                 end_map_x, end_map_y = self.world_to_map(end_x, end_y)
                 
                 if (0 <= end_map_x < self.map_size and 0 <= end_map_y < self.map_size):
-                    # Color rays based on range
+                    color = (0, 255, 255) if range_m < self.sensor_manager.lidar_max_range * 0.95 else (100, 100, 100)
+                    cv2.line(vis_map, (robot_map_x, robot_map_y), (end_map_x, end_map_y), color, 1)
                     if range_m < self.sensor_manager.lidar_max_range * 0.95:
-                        # Hit an obstacle - draw obstacle point
                         cv2.circle(vis_map, (end_map_x, end_map_y), 2, (0, 255, 0), -1)
-                        cv2.line(vis_map, (robot_map_x, robot_map_y), (end_map_x, end_map_y), (0, 255, 255), 1)
-                    else:
-                        # Free space to max range
-                        cv2.line(vis_map, (robot_map_x, robot_map_y), (end_map_x, end_map_y), (200, 200, 200), 1)
         
         # Resize and show
         vis_map_resized = cv2.resize(vis_map, (600, 600))
-        cv2.putText(vis_map_resized, f"LiDAR Navigation", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(vis_map_resized, f"Robot: ({robot_x:.1f}, {robot_y:.1f})", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(vis_map_resized, f"Heading: {np.degrees(robot_theta):.1f}°", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        if target_direction is not None:
-            target_relative = target_direction - robot_theta
-            while target_relative > np.pi:
-                target_relative -= 2 * np.pi
-            while target_relative < -np.pi:
-                target_relative += 2 * np.pi
-            cv2.putText(vis_map_resized, f"Target: {np.degrees(target_relative):.1f}° rel", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        cv2.putText(vis_map_resized, f"LiDAR Navigation", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(vis_map_resized, f"Pos: ({robot_x:.1f}, {robot_y:.1f})", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(vis_map_resized, f"Angle: {np.degrees(robot_theta):.1f}°", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
         cv2.imshow("LiDAR Navigation", vis_map_resized)
         cv2.waitKey(1)
